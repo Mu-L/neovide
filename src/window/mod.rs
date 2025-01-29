@@ -1,525 +1,289 @@
+mod error_window;
 mod keyboard_manager;
 mod mouse_manager;
-mod renderer;
 mod settings;
+mod update_loop;
+mod window_wrapper;
 
 #[cfg(target_os = "macos")]
-mod draw_background;
-
-use std::time::{Duration, Instant};
-
-use glutin::{
-    self,
-    dpi::PhysicalSize,
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::{self, Fullscreen, Icon},
-    ContextBuilder, GlProfile, WindowedContext,
-};
-use log::trace;
-use tokio::sync::mpsc::UnboundedReceiver;
-
-#[cfg(target_os = "macos")]
-use glutin::platform::macos::WindowBuilderExtMacOS;
-
-#[cfg(target_os = "macos")]
-use draw_background::draw_background;
+pub mod macos;
 
 #[cfg(target_os = "linux")]
-use glutin::platform::unix::WindowBuilderExtUnix;
+use std::env;
+
+use winit::{
+    dpi::{PhysicalSize, Size},
+    event_loop::{ActiveEventLoop, EventLoop},
+    window::{Cursor, Icon, Theme, Window},
+};
+
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+
+#[cfg(target_os = "linux")]
+use winit::platform::{wayland::WindowAttributesExtWayland, x11::WindowAttributesExtX11};
+
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
+
+#[cfg(target_os = "macos")]
+use winit::platform::macos::EventLoopBuilderExtMacOS;
+
+#[cfg(target_os = "macos")]
+use macos::register_file_handler;
 
 use image::{load_from_memory, GenericImageView, Pixel};
 use keyboard_manager::KeyboardManager;
 use mouse_manager::MouseManager;
-use renderer::SkiaRenderer;
 
 use crate::{
-    bridge::{ParallelCommand, UiCommand},
-    cmd_line::CmdLineSettings,
-    dimensions::Dimensions,
-    editor::EditorCommand,
-    event_aggregator::EVENT_AGGREGATOR,
+    cmd_line::{CmdLineSettings, GeometryArgs},
     frame::Frame,
-    redraw_scheduler::REDRAW_SCHEDULER,
-    renderer::Renderer,
-    renderer::WindowPadding,
-    running_tracker::*,
+    renderer::{build_window_config, DrawCommand, WindowConfig},
     settings::{
-        load_last_window_settings, save_window_geometry, PersistentWindowSettings, SETTINGS,
+        clamped_grid_size, load_last_window_settings, save_window_size, HotReloadConfigs,
+        PersistentWindowSettings, Settings, SettingsChanged,
     },
+    units::GridSize,
 };
-pub use settings::{KeyboardSettings, WindowSettings};
+pub use error_window::show_error_window;
+pub use settings::{WindowSettings, WindowSettingsChanged};
+pub use update_loop::ShouldRender;
+pub use update_loop::UpdateLoop;
+pub use window_wrapper::WinitWindowWrapper;
 
 static ICON: &[u8] = include_bytes!("../../assets/neovide.ico");
 
-const MIN_WINDOW_WIDTH: u64 = 20;
-const MIN_WINDOW_HEIGHT: u64 = 6;
+const DEFAULT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize {
+    width: 500,
+    height: 500,
+};
+const MIN_PERSISTENT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize {
+    width: 300,
+    height: 150,
+};
+const MAX_PERSISTENT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize {
+    width: 8192,
+    height: 8192,
+};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WindowCommand {
     TitleChanged(String),
     SetMouseEnabled(bool),
     ListAvailableFonts,
+    FocusWindow,
+    Minimize,
+    #[allow(dead_code)] // Theme change is only used on macOS right now
+    ThemeChanged(Option<Theme>),
+    #[cfg(windows)]
+    RegisterRightClick,
+    #[cfg(windows)]
+    UnregisterRightClick,
 }
 
-pub struct GlutinWindowWrapper {
-    windowed_context: WindowedContext<glutin::PossiblyCurrent>,
-    skia_renderer: SkiaRenderer,
-    renderer: Renderer,
-    keyboard_manager: KeyboardManager,
-    mouse_manager: MouseManager,
-    title: String,
-    fullscreen: bool,
-    font_changed_last_frame: bool,
-    saved_inner_size: PhysicalSize<u32>,
-    saved_grid_size: Option<Dimensions>,
-    size_at_startup: PhysicalSize<u32>,
-    maximized_at_startup: bool,
-    window_command_receiver: UnboundedReceiver<WindowCommand>,
+#[derive(Clone, Debug, PartialEq)]
+pub enum UserEvent {
+    DrawCommandBatch(Vec<DrawCommand>),
+    WindowCommand(WindowCommand),
+    SettingsChanged(SettingsChanged),
+    ConfigsChanged(Box<HotReloadConfigs>),
+    #[allow(dead_code)]
+    RedrawRequested,
+    NeovimExited,
 }
 
-impl GlutinWindowWrapper {
-    pub fn toggle_fullscreen(&mut self) {
-        let window = self.windowed_context.window();
-        if self.fullscreen {
-            window.set_fullscreen(None);
-        } else {
-            let handle = window.current_monitor();
-            window.set_fullscreen(Some(Fullscreen::Borderless(handle)));
-        }
-
-        self.fullscreen = !self.fullscreen;
-    }
-
-    pub fn synchronize_settings(&mut self) {
-        let fullscreen = { SETTINGS.get::<WindowSettings>().fullscreen };
-
-        if self.fullscreen != fullscreen {
-            self.toggle_fullscreen();
-        }
-    }
-
-    #[allow(clippy::needless_collect)]
-    pub fn handle_window_commands(&mut self) {
-        while let Ok(window_command) = self.window_command_receiver.try_recv() {
-            match window_command {
-                WindowCommand::TitleChanged(new_title) => self.handle_title_changed(new_title),
-                WindowCommand::SetMouseEnabled(mouse_enabled) => {
-                    self.mouse_manager.enabled = mouse_enabled
-                }
-                WindowCommand::ListAvailableFonts => self.send_font_names(),
-            }
-        }
-    }
-
-    pub fn handle_title_changed(&mut self, new_title: String) {
-        self.title = new_title;
-        self.windowed_context.window().set_title(&self.title);
-    }
-
-    pub fn send_font_names(&self) {
-        let font_names = self.renderer.font_names();
-        EVENT_AGGREGATOR.send(UiCommand::Parallel(ParallelCommand::DisplayAvailableFonts(
-            font_names,
-        )));
-    }
-
-    pub fn handle_quit(&mut self) {
-        if SETTINGS.get::<CmdLineSettings>().remote_tcp.is_none() {
-            EVENT_AGGREGATOR.send(UiCommand::Parallel(ParallelCommand::Quit));
-        } else {
-            RUNNING_TRACKER.quit("window closed");
-        }
-    }
-
-    pub fn handle_focus_lost(&mut self) {
-        EVENT_AGGREGATOR.send(UiCommand::Parallel(ParallelCommand::FocusLost));
-    }
-
-    pub fn handle_focus_gained(&mut self) {
-        EVENT_AGGREGATOR.send(UiCommand::Parallel(ParallelCommand::FocusGained));
-        REDRAW_SCHEDULER.queue_next_frame();
-    }
-
-    pub fn handle_event(&mut self, event: Event<()>) {
-        self.keyboard_manager.handle_event(&event);
-        self.mouse_manager.handle_event(
-            &event,
-            &self.keyboard_manager,
-            &self.renderer,
-            &self.windowed_context,
-        );
-        self.renderer.handle_event(&event);
-        match event {
-            Event::LoopDestroyed => {
-                self.handle_quit();
-            }
-            Event::Resumed => {
-                EVENT_AGGREGATOR.send(EditorCommand::RedrawScreen);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                self.handle_quit();
-            }
-            Event::WindowEvent {
-                event: WindowEvent::ScaleFactorChanged { scale_factor, .. },
-                ..
-            } => {
-                self.handle_scale_factor_update(scale_factor);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::DroppedFile(path),
-                ..
-            } => {
-                let file_path = path.into_os_string().into_string().unwrap();
-                EVENT_AGGREGATOR.send(UiCommand::Parallel(ParallelCommand::FileDrop(file_path)));
-            }
-            Event::WindowEvent {
-                event: WindowEvent::Focused(focus),
-                ..
-            } => {
-                if focus {
-                    self.handle_focus_gained();
-                } else {
-                    self.handle_focus_lost();
-                }
-            }
-            Event::RedrawRequested(..) | Event::WindowEvent { .. } => {
-                REDRAW_SCHEDULER.queue_next_frame()
-            }
-            _ => {}
-        }
-    }
-
-    pub fn draw_frame(&mut self, dt: f32) {
-        let window = self.windowed_context.window();
-        let new_size = window.inner_size();
-
-        let window_settings = SETTINGS.get::<WindowSettings>();
-        let window_padding = WindowPadding {
-            top: window_settings.padding_top,
-            left: window_settings.padding_left,
-            right: window_settings.padding_right,
-            bottom: window_settings.padding_bottom,
-        };
-
-        let padding_changed = window_padding != self.renderer.window_padding;
-        if padding_changed {
-            self.renderer.window_padding = window_padding;
-        }
-
-        if self.saved_inner_size != new_size || self.font_changed_last_frame || padding_changed {
-            self.font_changed_last_frame = false;
-            self.saved_inner_size = new_size;
-
-            self.handle_new_grid_size(new_size);
-            self.skia_renderer.resize(&self.windowed_context);
-        }
-
-        if REDRAW_SCHEDULER.should_draw() || SETTINGS.get::<WindowSettings>().no_idle {
-            self.font_changed_last_frame =
-                self.renderer.draw_frame(self.skia_renderer.canvas(), dt);
-            self.skia_renderer.gr_context.flush(None);
-            self.windowed_context.swap_buffers().unwrap();
-        }
-
-        // Wait until fonts are loaded, so we can set proper window size.
-        if !self.renderer.grid_renderer.is_ready {
-            return;
-        }
-
-        let settings = SETTINGS.get::<CmdLineSettings>();
-        // Resize at startup happens when window is maximized or when using tiling WM
-        // which already resized window.
-        let resized_at_startup = self.maximized_at_startup || self.has_been_resized();
-
-        log::trace!(
-            "Settings geometry {:?}",
-            PhysicalSize::from(settings.geometry)
-        );
-        log::trace!("Inner size: {:?}", new_size);
-
-        if self.saved_grid_size.is_none() && !resized_at_startup {
-            let window = self.windowed_context.window();
-            window.set_inner_size(
-                self.renderer
-                    .grid_renderer
-                    .convert_grid_to_physical(settings.geometry),
-            );
-            self.saved_grid_size = Some(settings.geometry);
-            // Font change at startup is ignored, so grid size (and startup screen) could be preserved.
-            // But only when not resized yet. With maximized or resized window we should redraw grid.
-            self.font_changed_last_frame = false;
-        }
-    }
-
-    fn handle_new_grid_size(&mut self, new_size: PhysicalSize<u32>) {
-        let window_padding = self.renderer.window_padding;
-        let window_padding_width = window_padding.left + window_padding.right;
-        let window_padding_height = window_padding.top + window_padding.bottom;
-
-        let content_size = PhysicalSize {
-            width: new_size.width - window_padding_width,
-            height: new_size.height - window_padding_height,
-        };
-
-        let grid_size = self
-            .renderer
-            .grid_renderer
-            .convert_physical_to_grid(content_size);
-
-        // Have a minimum size
-        if grid_size.width < MIN_WINDOW_WIDTH || grid_size.height < MIN_WINDOW_HEIGHT {
-            return;
-        }
-
-        if self.saved_grid_size == Some(grid_size) {
-            trace!("Grid matched saved size, skip update.");
-            return;
-        }
-        self.saved_grid_size = Some(grid_size);
-        EVENT_AGGREGATOR.send(UiCommand::Parallel(ParallelCommand::Resize {
-            width: grid_size.width,
-            height: grid_size.height,
-        }));
-    }
-
-    fn handle_scale_factor_update(&mut self, scale_factor: f64) {
-        self.renderer.handle_os_scale_factor_change(scale_factor);
-        EVENT_AGGREGATOR.send(EditorCommand::RedrawScreen);
-    }
-
-    fn has_been_resized(&self) -> bool {
-        self.windowed_context.window().inner_size() != self.size_at_startup
+impl From<Vec<DrawCommand>> for UserEvent {
+    fn from(value: Vec<DrawCommand>) -> Self {
+        UserEvent::DrawCommandBatch(value)
     }
 }
 
-pub fn create_window() {
-    let icon = {
-        let icon = load_from_memory(ICON).expect("Failed to parse icon data");
-        let (width, height) = icon.dimensions();
-        let mut rgba = Vec::with_capacity((width * height) as usize * 4);
-        for (_, _, pixel) in icon.pixels() {
-            rgba.extend_from_slice(&pixel.to_rgba().0);
-        }
-        Icon::from_rgba(rgba, width, height).expect("Failed to create icon object")
+impl From<WindowCommand> for UserEvent {
+    fn from(value: WindowCommand) -> Self {
+        UserEvent::WindowCommand(value)
+    }
+}
+
+impl From<SettingsChanged> for UserEvent {
+    fn from(value: SettingsChanged) -> Self {
+        UserEvent::SettingsChanged(value)
+    }
+}
+
+impl From<HotReloadConfigs> for UserEvent {
+    fn from(value: HotReloadConfigs) -> Self {
+        UserEvent::ConfigsChanged(Box::new(value))
+    }
+}
+
+pub fn create_event_loop() -> EventLoop<UserEvent> {
+    let mut builder = EventLoop::with_user_event();
+    #[cfg(target_os = "macos")]
+    builder.with_default_menu(false);
+    let event_loop = builder.build().expect("Failed to create winit event loop");
+    #[cfg(target_os = "macos")]
+    register_file_handler();
+    #[allow(clippy::let_and_return)]
+    event_loop
+}
+
+pub fn create_window(
+    event_loop: &ActiveEventLoop,
+    maximized: bool,
+    title: &str,
+    settings: &Settings,
+) -> WindowConfig {
+    let icon = load_icon();
+
+    let cmd_line_settings = settings.get::<CmdLineSettings>();
+
+    let window_settings = load_last_window_settings().ok();
+
+    let previous_position = match window_settings {
+        Some(PersistentWindowSettings::Windowed { position, .. }) => Some(position),
+        _ => None,
     };
 
-    let event_loop = EventLoop::new();
+    let mouse_cursor_icon = cmd_line_settings.mouse_cursor_icon;
 
-    let cmd_line_settings = SETTINGS.get::<CmdLineSettings>();
-
-    let mut maximized = cmd_line_settings.maximized;
-    let mut previous_position = None;
-    if let Ok(last_window_settings) = load_last_window_settings() {
-        match last_window_settings {
-            PersistentWindowSettings::Maximized => {
-                maximized = true;
-            }
-            PersistentWindowSettings::Windowed { position, .. } => {
-                previous_position = Some(position);
-            }
-        }
-    }
-
-    let winit_window_builder = window::WindowBuilder::new()
-        .with_title("Neovide")
-        .with_window_icon(Some(icon))
+    let window_attributes = Window::default_attributes()
+        .with_title(title)
+        .with_cursor(Cursor::Icon(mouse_cursor_icon.parse()))
         .with_maximized(maximized)
-        .with_transparent(true);
+        .with_transparent(true)
+        .with_visible(false);
+
+    #[cfg(target_family = "unix")]
+    let window_attributes = window_attributes.with_window_icon(Some(icon));
+
+    #[cfg(target_os = "windows")]
+    let window_attributes = window_attributes
+        .with_window_icon(Some(icon.clone()))
+        .with_taskbar_icon(Some(icon));
+
+    #[cfg(target_os = "windows")]
+    let window_attributes = if !cmd_line_settings.opengl {
+        WindowAttributesExtWindows::with_no_redirection_bitmap(window_attributes, true)
+    } else {
+        window_attributes
+    };
 
     let frame_decoration = cmd_line_settings.frame;
 
+    #[cfg(target_os = "macos")]
+    let title_hidden = cmd_line_settings.title_hidden;
+
     // There is only two options for windows & linux, no need to match more options.
     #[cfg(not(target_os = "macos"))]
-    let mut winit_window_builder =
-        winit_window_builder.with_decorations(frame_decoration == Frame::Full);
+    let mut window_attributes = window_attributes.with_decorations(frame_decoration == Frame::Full);
 
     #[cfg(target_os = "macos")]
-    let mut winit_window_builder = match frame_decoration {
-        Frame::Full => winit_window_builder,
-        Frame::None => winit_window_builder.with_decorations(false),
-        Frame::Buttonless => winit_window_builder
-            .with_transparent(true)
-            .with_title_hidden(true)
+    let mut window_attributes = match frame_decoration {
+        Frame::Full => window_attributes,
+        Frame::None => window_attributes.with_decorations(false),
+        Frame::Buttonless => window_attributes
+            .with_title_hidden(title_hidden)
             .with_titlebar_buttons_hidden(true)
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true),
-        Frame::Transparent => winit_window_builder
-            .with_title_hidden(true)
+        Frame::Transparent => window_attributes
+            .with_title_hidden(title_hidden)
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true),
     };
 
     if let Some(previous_position) = previous_position {
-        if !maximized {
-            winit_window_builder = winit_window_builder.with_position(previous_position);
-        }
+        window_attributes = window_attributes.with_position(previous_position);
     }
 
     #[cfg(target_os = "linux")]
-    let winit_window_builder = winit_window_builder
-        .with_app_id(cmd_line_settings.wayland_app_id)
-        .with_class(
-            cmd_line_settings.x11_wm_class_instance,
-            cmd_line_settings.x11_wm_class,
-        );
+    let window_attributes = {
+        if env::var("WAYLAND_DISPLAY").is_ok() {
+            let app_id = &cmd_line_settings.wayland_app_id;
+            WindowAttributesExtWayland::with_name(window_attributes, app_id.clone(), "neovide")
+        } else {
+            let class = &cmd_line_settings.x11_wm_class;
+            let instance = &cmd_line_settings.x11_wm_class_instance;
+            WindowAttributesExtX11::with_name(window_attributes, class, instance)
+        }
+    };
 
     #[cfg(target_os = "macos")]
-    let winit_window_builder = winit_window_builder.with_accepts_first_mouse(false);
+    let window_attributes = window_attributes.with_accepts_first_mouse(false);
 
-    let builder = ContextBuilder::new()
-        .with_pixel_format(24, 8)
-        .with_stencil_buffer(8)
-        .with_gl_profile(GlProfile::Core)
-        .with_srgb(cmd_line_settings.srgb)
-        .with_vsync(cmd_line_settings.vsync);
+    #[allow(clippy::let_and_return)]
+    let window_config = build_window_config(window_attributes, event_loop, settings);
 
-    let windowed_context = match builder
-        .clone()
-        .build_windowed(winit_window_builder.clone(), &event_loop)
-    {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            // haven't found any sane way to actually match on the pattern rabbithole CreationError
-            // provides, so here goes nothing
-            if err.to_string().contains("vsync") {
-                builder
-                    .with_vsync(false)
-                    .build_windowed(winit_window_builder, &event_loop)
-                    .unwrap()
-            } else {
-                panic!("{}", err);
-            }
-        }
-    };
-    let windowed_context = unsafe { windowed_context.make_current().unwrap() };
-
-    let window = windowed_context.window();
-    let initial_size = window.inner_size();
-
-    // Check that window is visible in some monitor, and reposition it if not.
-    let did_reposition = window
-        .current_monitor()
-        .and_then(|current_monitor| {
-            let monitor_position = current_monitor.position();
-            let monitor_size = current_monitor.size();
-            let monitor_width = monitor_size.width as i32;
-            let monitor_height = monitor_size.height as i32;
-
-            let window_position = window.outer_position().ok()?;
-            let window_size = window.outer_size();
-            let window_width = window_size.width as i32;
-            let window_height = window_size.height as i32;
-
-            if window_position.x + window_width < monitor_position.x
-                || window_position.y + window_height < monitor_position.y
-                || window_position.x > monitor_position.x + monitor_width
-                || window_position.y > monitor_position.y + monitor_height
-            {
-                window.set_outer_position(monitor_position);
-            }
-
-            Some(())
-        })
-        .is_some();
-
-    log::trace!("repositioned window: {}", did_reposition);
-
-    let scale_factor = windowed_context.window().scale_factor();
-    let renderer = Renderer::new(scale_factor);
-    let saved_inner_size = window.inner_size();
-
-    let skia_renderer = SkiaRenderer::new(&windowed_context);
-
-    let window_command_receiver = EVENT_AGGREGATOR.register_event::<WindowCommand>();
-
-    log::info!(
-        "window created (scale_factor: {:.4}, font_dimensions: {:?})",
-        scale_factor,
-        renderer.grid_renderer.font_dimensions,
-    );
-
-    let mut window_wrapper = GlutinWindowWrapper {
-        windowed_context,
-        skia_renderer,
-        renderer,
-        keyboard_manager: KeyboardManager::new(),
-        mouse_manager: MouseManager::new(),
-        title: String::from("Neovide"),
-        fullscreen: false,
-        font_changed_last_frame: false,
-        size_at_startup: initial_size,
-        maximized_at_startup: maximized,
-        saved_inner_size,
-        saved_grid_size: None,
-        window_command_receiver,
-    };
-
-    let mut previous_frame_start = Instant::now();
-
-    enum FocusedState {
-        Focused,
-        UnfocusedNotDrawn,
-        Unfocused,
+    #[cfg(target_os = "macos")]
+    if let Some(previous_position) = previous_position {
+        window_config.window.set_outer_position(previous_position);
     }
-    let mut focused = FocusedState::Focused;
 
-    event_loop.run(move |e, _window_target, control_flow| {
-        // Window focus changed
-        if let Event::WindowEvent {
-            event: WindowEvent::Focused(focused_event),
+    window_config
+}
+
+#[derive(Clone, Debug)]
+pub enum WindowSize {
+    Size(PhysicalSize<u32>),
+    Maximized,
+    Grid(GridSize<u32>),
+    NeovimGrid, // The geometry is read from init.vim/lua
+}
+
+pub fn determine_window_size(
+    window_settings: Option<&PersistentWindowSettings>,
+    settings: &Settings,
+) -> WindowSize {
+    let cmd_line = settings.get::<CmdLineSettings>();
+
+    match cmd_line.geometry {
+        GeometryArgs {
+            grid: Some(Some(dimensions)),
             ..
-        } = e
-        {
-            focused = if focused_event {
-                FocusedState::Focused
-            } else {
-                FocusedState::UnfocusedNotDrawn
-            };
-        }
-
-        if !RUNNING_TRACKER.is_running() {
-            let window = window_wrapper.windowed_context.window();
-            save_window_geometry(
-                window.is_maximized(),
-                window_wrapper.saved_grid_size,
-                window.outer_position().ok(),
-            );
-
-            std::process::exit(RUNNING_TRACKER.exit_code());
-        }
-
-        let frame_start = Instant::now();
-
-        window_wrapper.handle_window_commands();
-        window_wrapper.synchronize_settings();
-        window_wrapper.handle_event(e);
-
-        let refresh_rate = match focused {
-            FocusedState::Focused | FocusedState::UnfocusedNotDrawn => {
-                SETTINGS.get::<WindowSettings>().refresh_rate as f32
+        } => WindowSize::Grid(clamped_grid_size(&GridSize::new(
+            dimensions.width.try_into().unwrap(),
+            dimensions.height.try_into().unwrap(),
+        ))),
+        GeometryArgs {
+            grid: Some(None), ..
+        } => WindowSize::NeovimGrid,
+        GeometryArgs {
+            size: Some(dimensions),
+            ..
+        } => WindowSize::Size(dimensions.into()),
+        GeometryArgs {
+            maximized: true, ..
+        } => WindowSize::Maximized,
+        _ => match window_settings {
+            Some(PersistentWindowSettings::Maximized { .. }) => WindowSize::Maximized,
+            Some(PersistentWindowSettings::Windowed {
+                pixel_size: Some(pixel_size),
+                ..
+            }) => {
+                let size = Size::new(*pixel_size);
+                let scale = 1.0;
+                WindowSize::Size(
+                    Size::clamp(
+                        size,
+                        MIN_PERSISTENT_WINDOW_SIZE.into(),
+                        MAX_PERSISTENT_WINDOW_SIZE.into(),
+                        scale,
+                    )
+                    .to_physical(scale),
+                )
             }
-            FocusedState::Unfocused => SETTINGS.get::<WindowSettings>().refresh_rate_idle as f32,
-        }
-        .max(1.0);
+            _ => WindowSize::Size(DEFAULT_WINDOW_SIZE),
+        },
+    }
+}
 
-        let expected_frame_length_seconds = 1.0 / refresh_rate;
-        let frame_duration = Duration::from_secs_f32(expected_frame_length_seconds);
-
-        if frame_start - previous_frame_start > frame_duration {
-            let dt = previous_frame_start.elapsed().as_secs_f32();
-            window_wrapper.draw_frame(dt);
-            if let FocusedState::UnfocusedNotDrawn = focused {
-                focused = FocusedState::Unfocused;
-            }
-            previous_frame_start = frame_start;
-            #[cfg(target_os = "macos")]
-            draw_background(&window_wrapper.windowed_context);
-        }
-
-        *control_flow = ControlFlow::WaitUntil(previous_frame_start + frame_duration)
-    });
+pub fn load_icon() -> Icon {
+    let icon = load_from_memory(ICON).expect("Failed to parse icon data");
+    let (width, height) = icon.dimensions();
+    let mut rgba = Vec::with_capacity((width * height) as usize * 4);
+    for (_, _, pixel) in icon.pixels() {
+        rgba.extend_from_slice(&pixel.to_rgba().0);
+    }
+    Icon::from_rgba(rgba, width, height).expect("Failed to create icon object")
 }

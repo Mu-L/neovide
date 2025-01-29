@@ -1,10 +1,11 @@
-use crate::renderer::animation_utils::lerp;
-use crate::settings::SETTINGS;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
-use crate::renderer::{fonts::font_loader::*, RendererSettings};
+use crate::{
+    profiling::tracy_zone,
+    renderer::{animation_utils::lerp, fonts::font_loader::*, RendererSettings},
+    settings::Settings,
+};
 use skia_safe::{Canvas, Color, Paint, Point, Rect, Size};
 
 const FRAMETIMES_COUNT: usize = 48;
@@ -13,12 +14,13 @@ pub struct Profiler {
     pub font: Arc<FontPair>,
     pub position: Point,
     pub size: Size,
-    pub last_draw: Instant,
     pub frametimes: VecDeque<f32>,
+
+    settings: Arc<Settings>,
 }
 
 impl Profiler {
-    pub fn new(font_size: f32) -> Self {
+    pub fn new(font_size: f32, settings: Arc<Settings>) -> Self {
         let font_key = FontKey::default();
         let mut font_loader = FontLoader::new(font_size);
         let font = font_loader.get_or_load(&font_key).unwrap();
@@ -26,13 +28,15 @@ impl Profiler {
             font,
             position: Point::new(32.0, 32.0),
             size: Size::new(200.0, 120.0),
-            last_draw: Instant::now(),
             frametimes: VecDeque::with_capacity(FRAMETIMES_COUNT),
+
+            settings,
         }
     }
 
-    pub fn draw(&mut self, root_canvas: &mut Canvas, dt: f32) {
-        if !SETTINGS.get::<RendererSettings>().profiler {
+    pub fn draw(&mut self, root_canvas: &Canvas, dt: f32) {
+        tracy_zone!("profiler_draw");
+        if !self.settings.get::<RendererSettings>().profiler {
             return;
         }
 
@@ -69,7 +73,7 @@ impl Profiler {
         root_canvas.restore();
     }
 
-    fn draw_graph(&self, root_canvas: &mut Canvas) {
+    fn draw_graph(&self, root_canvas: &Canvas) {
         let mut paint = Paint::default();
         let color = Color::from_argb(255, 0, 100, 200);
         paint.set_color(color);

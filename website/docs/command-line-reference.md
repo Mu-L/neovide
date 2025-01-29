@@ -39,22 +39,15 @@ Can be set to:
 - (macOS only) `transparent`: Transparent decorations including a transparent bar.
 - (macOS only) `buttonless`: All decorations, but without quit, minimize or fullscreen buttons.
 
-### Geometry
+### Window Size
 
 ```sh
---geometry=<width>x<height>
+--size=<width>x<height>
 ```
 
-Sets the initial neovide window size in characters.
+Sets the initial neovide window size in pixels.
 
-### Log File
-
-```sh
---log
-```
-
-Enables the log file for debugging purposes. This will write a file next to the executable
-containing trace events which may help debug an issue.
+Can not be used together with `--maximized`, or `--grid`.
 
 ### Maximized
 
@@ -68,74 +61,171 @@ visible.
 This is not the same as `g:neovide_fullscreen`, which runs Neovide in "exclusive fullscreen",
 covering up the entire screen.
 
+Can not be used together with `--size`, or `--grid`.
+
+### Grid Size
+
+```sh
+--grid [<columns>x<lines>]
+
+```
+
+**Available since 0.12.0.**
+
+Sets the initial grid size of the window. If no value is given, it defaults to
+columns/lines from `init.vim/lua`, see
+[columns](https://neovim.io/doc/user/options.html#'columns') and
+[lines](https://neovim.io/doc/user/options.html#'lines').
+
+If the `--grid` argument is not set then the grid size is inferred from the
+window size.
+
+Note: After the initial size has been determined and `init.vim/lua` processed,
+you can set [columns](https://neovim.io/doc/user/options.html#'columns') and
+[lines](https://neovim.io/doc/user/options.html#'lines') inside neovim
+regardless of the command line arguments used. This has to be done before any
+redraws are made, so it's recommended to put it at the start of the
+`init.vim/lua` along with `guifont` and other related settings that can affect
+the geometry.
+
+Can not be used together with `--size`, or `--maximized`.
+
+### Log File
+
+```sh
+--log
+```
+
+Enables the log file for debugging purposes. This will write a file next to the executable
+containing trace events which may help debug an issue.
+
 ### Multigrid
 
 ```sh
---multigrid or $NEOVIDE_MULTIGRID
+--no-multigrid or $NEOVIDE_NO_MULTIGRID
 ```
 
-This enables neovim's multigrid functionality which will also enable floating window blurred
-backgrounds and window animations. For now this is disabled due to some mouse input bugs upstream
-([neovim/neovim/pull/12667](https://github.com/neovim/neovim/pull/12667),
-[neovim/neovim/issues/15075](https://github.com/neovim/neovim/issues/15075)) and some
-[floating window transparency issues](https://github.com/neovide/neovide/issues/720).
+This disables neovim's multigrid functionality which will also disable floating window blurred
+backgrounds, smooth scrolling, and window animations. This can solve some issues where neovide
+acts differently from terminal neovim.
 
-### No Fork
+### Fork
 
 ```sh
---nofork
+--fork or $NEOVIDE_FORK=0|1
 ```
 
-By default, neovide detaches itself from the terminal. Instead of spawning a child process and
-leaking it, be "blocking" and have the shell directly as parent process.
+Detach from the terminal instead of waiting for the Neovide process to
+terminate. This parameter has no effect when launching from a GUI.
 
 ### No Idle
 
 ```sh
---noidle or $NEOVIDE_NO_IDLE
+--no-idle or $NEOVIDE_IDLE=0|1
 ```
 
-Instead of skipping some frames in order to match `g:neovide_refresh_rate`, render every possible
-one.
+With idle `on` (default), neovide won't render new frames when nothing is happening.
 
-### No sRGB
+With idle `off` (e.g. with `--no-idle` flag), neovide will constantly render new frames,
+even when nothing changed. This takes more power and CPU time, but can possibly help
+with frame timing issues.
+
+### Mouse Cursor Icon
 
 ```sh
---nosrgb or $NEOVIDE_NO_SRGB
+--mouse-cursor-icon or $NEOVIDE_MOUSE_CURSOR_ICON="arrow|i-beam"
 ```
 
-Don't request sRGB on the window. Swapping sometimes fixes startup issues.
+**Available since 0.14.**
 
-### No Tabs
+This sets the mouse cursor icon to be used in the window.
+
+TLDR; Neovim has not yet implemented the
+['mouseshape'](https://github.com/neovim/neovim/issues/21458) feature, meaning that
+the cursor will not be reactive respecting the context of any Neovim element such as tabs,
+buttons and dividers. For that reason, the Arrow cursor has been taken as the default due
+to its generalistic purpose.
+
+### Title (macOS Only)
 
 ```sh
---notabs
+--title-hidden or $NEOVIDE_TITLE_HIDDEN
+```
+
+**Available since 0.12.2.**
+
+This sets the window title to be hidden on macOS.
+
+### sRGB
+
+```sh
+--no-srgb, --srgb or $NEOVIDE_SRGB=0|1
+```
+
+Request sRGB support on the window. The command line parameter takes priority
+over the environment variable.
+
+On Windows, Neovide does not actually render with sRGB, but it's still enabled
+by default to work around
+[neovim/neovim/issues/907](https://github.com/neovim/neovim/issues/907).
+
+On macOS, this option works as expected to switch sRGB color space. The
+default is `--no-srgb` to keep the behavior of previous versions. If you want
+to enable srgb, please use `--srgb`.
+
+Other platforms should not need it, but if you encounter either startup crashes
+or wrong colors, you can try to swap the option.
+
+Notes on macOS: Traditional terminals do not use sRGB by default. This is how
+most terminals on Windows and Linux do. Neovide follows this rule. However,
+Terminal of macOS changes the default to sRGB. Other terminal emulators, like
+Alacritty, Kitty, may follow Apple and use sRGB. Some may offer no function
+to switch it off currently. So you might get different color of the same value
+in Neovide surprisingly. Please read
+[neovide/neovide/issues/1102](https://github.com/neovide/neovide/issues/1102)
+for more details.
+
+### Tabs
+
+```sh
+--no-tabs, --tabs or $NEOVIDE_TABS=0|1
 ```
 
 By default, Neovide opens files given directly to Neovide (not NeoVim through `--`!) in multiple
-tabs to avoid confusing new users. The option disables that and makes multiple given files to normal
-buffers.
+tabs to avoid confusing new users. `--no-tabs` disables this behavior.
 
 Note: Even if files are opened in tabs, they're buffers anyways. It's just about them being visible
 or not.
 
-## No VSync
+### OpenGL Renderer
 
 ```sh
---novsync
+--opengl or $NEOVIDE_OPENGL=1
+```
+
+By default, Neovide uses D3D on Windows and Metal on macOS as renderer. You
+can use `--opengl` to force OpenGL when you meet some problems of D3D/Metal.
+
+### No VSync
+
+```sh
+--no-vsync, --vsync or $NEOVIDE_VSYNC=0|1
 ```
 
 **Available since 0.10.2.**
 
-By default, Neovide requests to use VSync on the created window. This option disables this behavior.
+By default, Neovide requests to use VSync on the created window. `--no-vsync`
+disables this behavior. The command line parameter takes priority over the
+environment variable. If you don't enable vsync, then `g:neovide_refresh_rate`
+will be used.
 
-### Remote TCP
+### Neovim Server
 
 ```sh
---remote-tcp <remote_tcp>
+--server <ADDRESS>
 ```
 
-What IP and port to use when connecting to neovim.
+Connects to the named pipe or socket at ADDRESS.
 
 ### WSL
 
